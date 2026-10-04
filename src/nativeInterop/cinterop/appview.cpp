@@ -2667,18 +2667,6 @@ static void textInputCommit(wl_client*, wl_resource* resource) {
     input->commitSerial++;
     updateHostTextInputState(input->view);
 }
-static void textInputSetAvailableActions(wl_client*, wl_resource*, wl_array*) {}
-static void textInputShowInputPanel(wl_client*, wl_resource* resource) {
-    if (auto* input = static_cast<TextInput*>(wl_resource_get_user_data(resource))) {
-        updateHostTextInputState(input->view);
-    }
-}
-static void textInputHideInputPanel(wl_client*, wl_resource* resource) {
-    auto* input = static_cast<TextInput*>(wl_resource_get_user_data(resource));
-    if (!input || !input->view) return;
-    if (SDL_Window* window = SDL_GetKeyboardFocus()) SDL_StopTextInput(window);
-}
-
 static void textInputResourceDestroyed(wl_resource* resource) {
     auto* input = static_cast<TextInput*>(wl_resource_get_user_data(resource));
     if (!input) return;
@@ -3031,9 +3019,6 @@ static void initializeInterfaces() {
     g_textInputImpl.set_content_type = textInputSetContentType;
     g_textInputImpl.set_cursor_rectangle = textInputSetCursorRectangle;
     g_textInputImpl.commit = textInputCommit;
-    g_textInputImpl.set_available_actions = textInputSetAvailableActions;
-    g_textInputImpl.show_input_panel = textInputShowInputPanel;
-    g_textInputImpl.hide_input_panel = textInputHideInputPanel;
 
     g_dmaBufferImpl.destroy = dmaBufferDestroy;
     g_dmabufImpl.destroy = dmabufDestroy;
