@@ -1,0 +1,3 @@
+headers = appview.h
+package = dev.brahmkshatriya.wayland.appview.internal.cinterop
+linkerOpts = -L/usr/lib -L/usr/lib64 -L/usr/lib/x86_64-linux-gnu -lwayland-server -lSDL3 -lEGL -lGL -lxkbcommon -ldl -lstdc++ -lm
