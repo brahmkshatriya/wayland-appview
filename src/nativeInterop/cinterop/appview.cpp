@@ -2080,7 +2080,6 @@ static void initializeInterfaces() {
 
     g_compositorImpl.create_surface = compositorCreateSurface;
     g_compositorImpl.create_region = compositorCreateRegion;
-    g_compositorImpl.release = compositorRelease;
 
     g_regionImpl.destroy = regionDestroy;
     g_regionImpl.add = regionAdd;
@@ -2170,7 +2169,6 @@ static void initializeInterfaces() {
 
     g_dataDeviceManagerImpl.create_data_source = dataDeviceManagerCreateSource;
     g_dataDeviceManagerImpl.get_data_device = dataDeviceManagerGetDevice;
-    g_dataDeviceManagerImpl.release = dataDeviceManagerRelease;
     g_dataSourceImpl.offer = dataSourceOffer;
     g_dataSourceImpl.destroy = dataSourceDestroy;
     g_dataSourceImpl.set_actions = dataSourceSetActions;
