@@ -7,7 +7,7 @@ Supported Kotlin/Native targets:
 - `linuxX64`
 - `linuxArm64`
 
-The compositor imports Linux DMA-BUF buffers through EGL/OpenGL when possible and falls back to `wl_shm`. It also forwards pointer/keyboard input, client cursor surfaces, fractional scaling, frame callbacks, popups/subsurfaces, and xdg-toplevel fullscreen requests.
+The compositor imports Linux DMA-BUF buffers through EGL/OpenGL when possible and falls back to `wl_shm`. It also forwards pointer/keyboard input, client cursor surfaces, fractional scaling, frame callbacks, popups/subsurfaces, host clipboard text, `text-input-v3` IME events, and xdg-toplevel fullscreen requests.
 
 ## Dependency
 
@@ -126,7 +126,7 @@ Publish a local snapshot without release signing:
 ./gradlew publishToMavenLocal -PRELEASE_SIGNING_ENABLED=false
 ```
 
-The default local version is `0.1.0-SNAPSHOT`. Override it with the publishing plugin's
+The default local version is `0.1.1-SNAPSHOT`. Override it with the publishing plugin's
 `VERSION_NAME` property:
 
 ```bash
@@ -176,8 +176,8 @@ Manual publishes use the workflow's `version` input. Tag publishes use the tag n
 
 Wayland AppView is an application embedder, not a complete desktop compositor. In particular:
 
-- Clipboard/data-device objects exist, but clipboard contents are not yet bridged to the host desktop.
-- Primary selection, text-input/IME, XDG activation, decoration-manager, and several optional desktop protocols are not implemented yet.
-- Subsurface stacking (`place_above` / `place_below`) is not fully modeled.
+- Drag-and-drop and primary selection are not implemented yet; clipboard text selection is bridged to the host desktop.
+- XDG activation and several optional desktop protocols are not implemented yet.
+- Touch input is not implemented yet.
 - DMA-BUF release synchronization currently uses `glFinish()` rather than explicit GPU fences.
 - X11-only applications require an Xwayland instance connected to the private compositor.

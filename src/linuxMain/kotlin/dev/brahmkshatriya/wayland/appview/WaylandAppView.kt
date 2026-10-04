@@ -35,6 +35,10 @@ import dev.brahmkshatriya.wayland.appview.internal.cinterop.appview_scroll
 import dev.brahmkshatriya.wayland.appview.internal.cinterop.appview_set_focused
 import dev.brahmkshatriya.wayland.appview.internal.cinterop.appview_socket_name
 import dev.brahmkshatriya.wayland.appview.internal.cinterop.appview_terminate
+import dev.brahmkshatriya.wayland.appview.internal.cinterop.appview_text_input_preedit
+import dev.brahmkshatriya.wayland.appview.internal.cinterop.appview_text_input_delete_surrounding
+import dev.brahmkshatriya.wayland.appview.internal.cinterop.appview_text_input_commit
+import dev.brahmkshatriya.wayland.appview.internal.cinterop.appview_text_input_active
 import dev.brahmkshatriya.wayland.appview.internal.cinterop.appview_title
 import kotlinx.cinterop.toKString
 
@@ -46,6 +50,7 @@ public data class WaylandAppViewStatus(
     public val error: String?,
     public val isMapped: Boolean,
     public val fullscreenRequested: Boolean,
+    public val textInputActive: Boolean = false,
 )
 
 /**
@@ -81,6 +86,10 @@ public class WaylandAppViewController public constructor() {
     public val fullscreenRequested: Boolean
         get() = handle?.let(::appview_fullscreen_requested) != 0
 
+    /** Whether the focused embedded client currently has an active text-input-v3 session. */
+    public val textInputActive: Boolean
+        get() = handle?.let(::appview_text_input_active) != 0
+
     /** A point-in-time status snapshot suitable for logging or non-Compose callers. */
     public val status: WaylandAppViewStatus
         get() =
@@ -91,6 +100,7 @@ public class WaylandAppViewController public constructor() {
                 error = error,
                 isMapped = isMapped,
                 fullscreenRequested = fullscreenRequested,
+                textInputActive = textInputActive,
             )
 
     internal val nativeView: NativeInteropView =
@@ -118,6 +128,27 @@ public class WaylandAppViewController public constructor() {
     /** Terminates the child launched by [launch], while keeping the compositor reusable. */
     public fun stop(): Unit {
         handle?.let(::appview_terminate)
+    }
+
+    /**
+     * Sends IME preedit text to the focused embedded text input. Cursor offsets are UTF-8 byte
+     * offsets, matching `zwp_text_input_v3.preedit_string`.
+     */
+    public fun updatePreedit(text: String, cursorBegin: Int, cursorEnd: Int): Unit {
+        val native = handle ?: return
+        appview_text_input_preedit(native, text, cursorBegin, cursorEnd)
+    }
+
+    /** Commits text through the focused embedded `zwp_text_input_v3` session. */
+    public fun commitText(text: String): Unit {
+        val native = handle ?: return
+        appview_text_input_commit(native, text)
+    }
+
+    /** Requests deletion around the embedded text cursor, using UTF-8 byte lengths. */
+    public fun deleteSurroundingText(beforeLength: UInt, afterLength: UInt): Unit {
+        val native = handle ?: return
+        appview_text_input_delete_surrounding(native, beforeLength, afterLength)
     }
 
     /** Requests another host render pass. Usually unnecessary because AppView renders continuously. */

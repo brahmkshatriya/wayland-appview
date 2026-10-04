@@ -14,9 +14,12 @@
 #include "linux-dmabuf-unstable-v1-server-protocol.h"
 #include "viewporter-server-protocol.h"
 #include "fractional-scale-v1-server-protocol.h"
+#include "xdg-decoration-unstable-v1-server-protocol.h"
+#include "text-input-unstable-v3-server-protocol.h"
 #include "xdg-shell-server-protocol.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cerrno>
 #include <chrono>
@@ -27,6 +30,8 @@
 #include <cstring>
 #include <fcntl.h>
 #include <memory>
+#include <mutex>
+#include <poll.h>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -91,6 +96,25 @@ struct Positioner {
     int offsetY = 0;
     uint32_t anchor = XDG_POSITIONER_ANCHOR_NONE;
     uint32_t gravity = XDG_POSITIONER_GRAVITY_NONE;
+    uint32_t constraintAdjustment = XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_NONE;
+};
+
+struct RegionRect {
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+};
+
+struct RegionData {
+    std::vector<RegionRect> rects;
+};
+
+struct InputRegionState {
+    // null wl_region means the default infinite input region, clipped later to
+    // the surface bounds. A non-default state with no rectangles is empty.
+    bool defaultRegion = true;
+    std::vector<RegionRect> rects;
 };
 
 struct ViewportState {
@@ -137,6 +161,7 @@ struct Surface {
     wl_resource* subsurface = nullptr;
     wl_resource* viewport = nullptr;
     wl_resource* fractionalScale = nullptr;
+    wl_resource* xdgDecoration = nullptr;
     Surface* parent = nullptr;
     bool synchronized = true;
 
@@ -157,6 +182,9 @@ struct Surface {
     WindowGeometryState windowGeometry;
     WindowGeometryState pendingWindowGeometry;
     WindowGeometryState cachedWindowGeometry;
+    InputRegionState inputRegion;
+    InputRegionState pendingInputRegion;
+    InputRegionState cachedInputRegion;
     bool mapped = false;
     bool dirty = true;
     bool enteredOutput = false;
@@ -169,6 +197,45 @@ struct Surface {
     std::string title;
 };
 
+
+
+enum class PendingTextEventType { Preedit, Commit };
+
+struct PendingTextEvent {
+    PendingTextEventType type = PendingTextEventType::Commit;
+    std::string text;
+    int cursorBeginCharacters = 0;
+    int cursorEndCharacters = 0;
+};
+
+struct DataSource {
+    AppView* view = nullptr;
+    wl_resource* resource = nullptr;
+    std::vector<std::string> mimeTypes;
+};
+
+struct DataOffer {
+    AppView* view = nullptr;
+    wl_resource* resource = nullptr;
+};
+
+struct TextInput {
+    AppView* view = nullptr;
+    wl_resource* resource = nullptr;
+    wl_resource* seat = nullptr;
+    Surface* focus = nullptr;
+    bool pendingEnabled = false;
+    bool enabled = false;
+    uint32_t commitSerial = 0;
+    std::string surroundingText;
+    int32_t cursor = 0;
+    int32_t anchor = 0;
+    int32_t cursorX = 0;
+    int32_t cursorY = 0;
+    int32_t cursorWidth = 0;
+    int32_t cursorHeight = 0;
+};
+
 struct OutputBinding {
     wl_client* client = nullptr;
     wl_resource* resource = nullptr;
@@ -179,6 +246,7 @@ struct SeatBinding {
     wl_resource* seat = nullptr;
     wl_resource* pointer = nullptr;
     wl_resource* keyboard = nullptr;
+    wl_resource* dataDevice = nullptr;
 };
 
 struct GlState {
@@ -212,6 +280,7 @@ struct AppView {
     std::string title = "Embedded application";
     std::string pendingCommand;
     pid_t childPid = -1;
+    pid_t childPgid = -1;
 
     wl_global* compositorGlobal = nullptr;
     wl_global* subcompositorGlobal = nullptr;
@@ -222,17 +291,32 @@ struct AppView {
     wl_global* dmabufGlobal = nullptr;
     wl_global* viewporterGlobal = nullptr;
     wl_global* fractionalScaleGlobal = nullptr;
+    wl_global* decorationGlobal = nullptr;
+    wl_global* textInputGlobal = nullptr;
 
     std::vector<std::unique_ptr<Surface>> surfaces;
     std::vector<OutputBinding> outputs;
     std::vector<SeatBinding> seats;
+    std::vector<TextInput*> textInputs;
+    wl_resource* selectionSource = nullptr;
+    std::string clipboardText;
+    uint32_t lastClipboardPollMs = 0;
+    std::atomic<bool> textInputWatchActive{false};
+    std::atomic<SDL_WindowID> textInputWindowId{0};
+    std::mutex textEventMutex;
+    std::vector<PendingTextEvent> pendingTextEvents;
+    bool eventWatchInstalled = false;
 
     Surface* pointerFocus = nullptr;
+    Surface* pointerImplicitGrab = nullptr;
     Surface* keyboardFocus = nullptr;
     Surface* cursorSurface = nullptr;
+    Surface* popupGrab = nullptr;
     int cursorHotspotX = 0;
     int cursorHotspotY = 0;
     SDL_Cursor* customCursor = nullptr;
+    std::vector<std::pair<SDL_Cursor*, uint64_t>> retiredCursors;
+    uint64_t renderSequence = 0;
     bool hostFocused = false;
     double pointerX = 0.0;
     double pointerY = 0.0;
@@ -240,6 +324,7 @@ struct AppView {
     double pointerWindowOriginX = 0.0;
     double pointerWindowOriginY = 0.0;
     uint32_t serial = 1;
+    uint32_t pressedPointerButtons = 0;
 
     int hostWidth = 1280;
     int hostHeight = 720;
@@ -278,8 +363,13 @@ static struct wp_viewporter_interface g_viewporterImpl{};
 static struct wp_viewport_interface g_viewportImpl{};
 static struct wp_fractional_scale_manager_v1_interface g_fractionalScaleManagerImpl{};
 static struct wp_fractional_scale_v1_interface g_fractionalScaleImpl{};
+static struct zxdg_decoration_manager_v1_interface g_decorationManagerImpl{};
+static struct zxdg_toplevel_decoration_v1_interface g_toplevelDecorationImpl{};
 static struct wl_data_source_interface g_dataSourceImpl{};
 static struct wl_data_device_interface g_dataDeviceImpl{};
+static struct wl_data_offer_interface g_dataOfferImpl{};
+static struct zwp_text_input_manager_v3_interface g_textInputManagerImpl{};
+static struct zwp_text_input_v3_interface g_textInputImpl{};
 static struct xdg_wm_base_interface g_xdgWmBaseImpl{};
 static struct xdg_positioner_interface g_positionerImpl{};
 static struct xdg_surface_interface g_xdgSurfaceImpl{};
@@ -296,6 +386,11 @@ struct BufferWatch {
 };
 
 static std::unordered_map<wl_resource*, BufferWatch*> g_bufferWatches;
+
+static void sendClipboardSelectionToClient(AppView* view, wl_client* client);
+static void updateTextInputFocus(AppView* view, Surface* oldSurface, Surface* newSurface);
+static void updateHostTextInputState(AppView* view);
+
 
 static void bufferWatchDestroyed(wl_listener* listener, void*) {
     auto* watch = reinterpret_cast<BufferWatch*>(listener);
@@ -382,12 +477,40 @@ static std::pair<double, double> surfaceLogicalSize(const Surface* surface, int 
     return {static_cast<double>(bw) / scale, static_cast<double>(bh) / scale};
 }
 
+static void retireHostCursor(AppView* view, SDL_Cursor* cursor) {
+    if (!view || !cursor) return;
+    view->retiredCursors.emplace_back(cursor, view->renderSequence);
+}
+
+static void collectRetiredHostCursors(AppView* view, bool force = false) {
+    if (!view || view->retiredCursors.empty()) return;
+    SDL_Cursor* active = SDL_GetCursor();
+    view->retiredCursors.erase(
+        std::remove_if(
+            view->retiredCursors.begin(), view->retiredCursors.end(),
+            [&](const auto& retired) {
+                SDL_Cursor* cursor = retired.first;
+                const uint64_t retiredAt = retired.second;
+                if (!cursor || cursor == active) return false;
+                // SDL's Wayland backend may still have protocol work queued for
+                // the cursor surface immediately after SDL_SetCursor(). Keep old
+                // cursors alive for a while before releasing their wl_* proxies.
+                if (!force && view->renderSequence - retiredAt < 120) return false;
+                SDL_DestroyCursor(cursor);
+                return true;
+            }),
+        view->retiredCursors.end());
+}
+
 static void resetHostCursor(AppView* view) {
     if (!view) return;
     if (view->customCursor) {
-        if (SDL_Cursor* defaultCursor = SDL_GetDefaultCursor()) SDL_SetCursor(defaultCursor);
-        SDL_DestroyCursor(view->customCursor);
-        view->customCursor = nullptr;
+        SDL_Cursor* oldCursor = view->customCursor;
+        SDL_Cursor* defaultCursor = SDL_GetDefaultCursor();
+        if (defaultCursor && SDL_SetCursor(defaultCursor)) {
+            view->customCursor = nullptr;
+            retireHostCursor(view, oldCursor);
+        }
     }
     view->cursorSurface = nullptr;
     SDL_ShowCursor();
@@ -466,10 +589,7 @@ static void applyHostCursor(AppView* view) {
     if (!view) return;
     Surface* surface = view->cursorSurface;
     if (!surface) {
-        if (view->customCursor) {
-            SDL_DestroyCursor(view->customCursor);
-            view->customCursor = nullptr;
-        }
+        resetHostCursor(view);
         SDL_HideCursor();
         return;
     }
@@ -517,9 +637,13 @@ static void applyHostCursor(AppView* view) {
     if (!cursor) return;
 
     SDL_ShowCursor();
-    SDL_SetCursor(cursor);
-    if (view->customCursor) SDL_DestroyCursor(view->customCursor);
-    view->customCursor = cursor;
+    if (SDL_SetCursor(cursor)) {
+        SDL_Cursor* oldCursor = view->customCursor;
+        view->customCursor = cursor;
+        if (oldCursor) retireHostCursor(view, oldCursor);
+    } else {
+        SDL_DestroyCursor(cursor);
+    }
 }
 
 static std::pair<int, int> absolutePosition(const Surface* surface) {
@@ -552,6 +676,44 @@ static bool surfaceVisible(const Surface* surface) {
     return true;
 }
 
+static bool isDescendantOf(const Surface* surface, const Surface* ancestor) {
+    for (auto* current = surface; current; current = current->parent) {
+        if (current == ancestor) return true;
+    }
+    return false;
+}
+
+static void moveSurfaceRelative(Surface* surface, Surface* sibling, bool above) {
+    if (!surface || !sibling || surface == sibling || surface->view != sibling->view) return;
+    auto& surfaces = surface->view->surfaces;
+    auto surfaceIt = std::find_if(
+        surfaces.begin(), surfaces.end(), [surface](const auto& item) { return item.get() == surface; });
+    if (surfaceIt == surfaces.end()) return;
+    std::unique_ptr<Surface> owned = std::move(*surfaceIt);
+    surfaces.erase(surfaceIt);
+    auto siblingIt = std::find_if(
+        surfaces.begin(), surfaces.end(), [sibling](const auto& item) { return item.get() == sibling; });
+    if (siblingIt == surfaces.end()) {
+        surfaces.push_back(std::move(owned));
+        return;
+    }
+    if (above) ++siblingIt;
+    surfaces.insert(siblingIt, std::move(owned));
+    surface->view->sceneDirty = true;
+}
+
+static void raiseSurface(Surface* surface) {
+    if (!surface || !surface->view) return;
+    auto& surfaces = surface->view->surfaces;
+    auto it = std::find_if(
+        surfaces.begin(), surfaces.end(), [surface](const auto& item) { return item.get() == surface; });
+    if (it == surfaces.end() || std::next(it) == surfaces.end()) return;
+    std::unique_ptr<Surface> owned = std::move(*it);
+    surfaces.erase(it);
+    surfaces.push_back(std::move(owned));
+    surface->view->sceneDirty = true;
+}
+
 static Surface* rootSurface(AppView* view) {
     for (auto& candidate : view->surfaces) {
         if (!candidate->cursorRole && candidate->mapped && candidate->xdgToplevel && candidate->parent == nullptr) {
@@ -562,6 +724,33 @@ static Surface* rootSurface(AppView* view) {
         if (!candidate->cursorRole && candidate->mapped && candidate->parent == nullptr) return candidate.get();
     }
     return nullptr;
+}
+
+static bool isInPopupTree(Surface* surface) {
+    for (auto* current = surface; current; current = current->parent) {
+        if (current->xdgPopup) return true;
+    }
+    return false;
+}
+
+static Surface* keyboardFocusTarget(Surface* surface) {
+    for (auto* current = surface; current; current = current->parent) {
+        if (current->xdgToplevel) return current;
+    }
+    return surface;
+}
+
+static bool pointInInputRegion(const Surface* surface, double x, double y) {
+    if (!surface) return false;
+    const auto& region = surface->inputRegion;
+    if (region.defaultRegion) return true;
+    for (const auto& rect : region.rects) {
+        if (x >= rect.x && y >= rect.y &&
+            x < rect.x + rect.width && y < rect.y + rect.height) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static Surface* hitTest(AppView* view, double x, double y) {
@@ -576,7 +765,10 @@ static Surface* hitTest(AppView* view, double x, double y) {
         if (bw <= 0 || bh <= 0) continue;
         const auto [width, height] = surfaceLogicalSize(surface, bw, bh);
         auto [sx, sy] = absolutePosition(surface);
-        if (x >= sx && y >= sy && x < sx + width && y < sy + height) return surface;
+        if (x >= sx && y >= sy && x < sx + width && y < sy + height &&
+            pointInInputRegion(surface, x - sx, y - sy)) {
+            return surface;
+        }
     }
     return rootSurface(view);
 }
@@ -612,12 +804,96 @@ static void sendToplevelConfigure(Surface* surface) {
 
 static void sendPopupConfigure(Surface* surface, Positioner* positioner) {
     if (!surface || !surface->xdgSurface || !surface->xdgPopup) return;
-    int x = positioner ? positioner->anchorX + positioner->offsetX : 0;
-    int y = positioner ? positioner->anchorY + positioner->offsetY : 0;
-    int width = positioner ? std::max(1, positioner->width) : 320;
-    int height = positioner ? std::max(1, positioner->height) : 240;
+    const Positioner fallback{};
+    const Positioner* p = positioner ? positioner : &fallback;
+    const int width = std::max(1, p->width);
+    const int height = std::max(1, p->height);
+
+    int anchorX = p->anchorX;
+    int anchorY = p->anchorY;
+    switch (p->anchor) {
+        case XDG_POSITIONER_ANCHOR_TOP: anchorX += p->anchorWidth / 2; break;
+        case XDG_POSITIONER_ANCHOR_TOP_RIGHT: anchorX += p->anchorWidth; break;
+        case XDG_POSITIONER_ANCHOR_LEFT: anchorY += p->anchorHeight / 2; break;
+        case XDG_POSITIONER_ANCHOR_RIGHT:
+            anchorX += p->anchorWidth;
+            anchorY += p->anchorHeight / 2;
+            break;
+        case XDG_POSITIONER_ANCHOR_BOTTOM_LEFT: anchorY += p->anchorHeight; break;
+        case XDG_POSITIONER_ANCHOR_BOTTOM:
+            anchorX += p->anchorWidth / 2;
+            anchorY += p->anchorHeight;
+            break;
+        case XDG_POSITIONER_ANCHOR_BOTTOM_RIGHT:
+            anchorX += p->anchorWidth;
+            anchorY += p->anchorHeight;
+            break;
+        case XDG_POSITIONER_ANCHOR_NONE:
+            anchorX += p->anchorWidth / 2;
+            anchorY += p->anchorHeight / 2;
+            break;
+        case XDG_POSITIONER_ANCHOR_TOP_LEFT:
+        default:
+            break;
+    }
+
+    int x = anchorX + p->offsetX;
+    int y = anchorY + p->offsetY;
+    switch (p->gravity) {
+        case XDG_POSITIONER_GRAVITY_TOP_LEFT:
+            x -= width; y -= height; break;
+        case XDG_POSITIONER_GRAVITY_TOP:
+            x -= width / 2; y -= height; break;
+        case XDG_POSITIONER_GRAVITY_TOP_RIGHT:
+            y -= height; break;
+        case XDG_POSITIONER_GRAVITY_LEFT:
+            x -= width; y -= height / 2; break;
+        case XDG_POSITIONER_GRAVITY_RIGHT:
+            y -= height / 2; break;
+        case XDG_POSITIONER_GRAVITY_BOTTOM_LEFT:
+            x -= width; break;
+        case XDG_POSITIONER_GRAVITY_BOTTOM:
+            x -= width / 2; break;
+        case XDG_POSITIONER_GRAVITY_NONE:
+            x -= width / 2; y -= height / 2; break;
+        case XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT:
+        default:
+            break;
+    }
+
+    int parentWidth = 0;
+    int parentHeight = 0;
+    if (surface->parent) {
+        if (surface->parent->windowGeometry.set) {
+            parentWidth = surface->parent->windowGeometry.width;
+            parentHeight = surface->parent->windowGeometry.height;
+        } else {
+            auto [pbw, pbh] = bufferSize(surface->parent->currentBuffer);
+            if ((pbw <= 0 || pbh <= 0) && surface->parent->cachedShmTexture != 0) {
+                pbw = surface->parent->cachedShmWidth;
+                pbh = surface->parent->cachedShmHeight;
+            }
+            auto [pw, ph] = surfaceLogicalSize(surface->parent, pbw, pbh);
+            parentWidth = static_cast<int>(std::lround(pw));
+            parentHeight = static_cast<int>(std::lround(ph));
+        }
+    }
+    const uint32_t adjustX = XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X |
+                             XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X |
+                             XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_X;
+    const uint32_t adjustY = XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y |
+                             XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y |
+                             XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_Y;
+    if (parentWidth > 0 && (p->constraintAdjustment & adjustX)) {
+        x = std::clamp(x, std::min(0, parentWidth - width), std::max(0, parentWidth - width));
+    }
+    if (parentHeight > 0 && (p->constraintAdjustment & adjustY)) {
+        y = std::clamp(y, std::min(0, parentHeight - height), std::max(0, parentHeight - height));
+    }
+
     surface->x = x;
     surface->y = y;
+    raiseSurface(surface);
     xdg_popup_send_configure(surface->xdgPopup, x, y, width, height);
     xdg_surface_send_configure(surface->xdgSurface, nextSerial(surface->view));
 }
@@ -1094,6 +1370,7 @@ static void updateKeyboardFocus(AppView* view, Surface* target) {
     if (view->keyboardFocus == target) return;
     Surface* old = view->keyboardFocus;
     view->keyboardFocus = target;
+    updateTextInputFocus(view, old, target);
     if (old && old->resource) {
         wl_client* client = wl_resource_get_client(old->resource);
         for (auto& seat : view->seats) {
@@ -1104,6 +1381,7 @@ static void updateKeyboardFocus(AppView* view, Surface* target) {
     }
     if (target && target->resource) {
         wl_client* client = wl_resource_get_client(target->resource);
+        sendClipboardSelectionToClient(view, client);
         for (auto& seat : view->seats) {
             if (seat.client == client && seat.keyboard) {
             wl_array keys;
@@ -1175,6 +1453,7 @@ static bool spawnPendingChild(AppView* view) {
         return false;
     }
     if (pid == 0) {
+        setpgid(0, 0);
         setenv("WAYLAND_DISPLAY", view->socketName.c_str(), 1);
         setenv("GDK_BACKEND", "wayland", 1);
         setenv("QT_QPA_PLATFORM", "wayland", 1);
@@ -1183,15 +1462,47 @@ static bool spawnPendingChild(AppView* view) {
         execl("/bin/sh", "sh", "-lc", command.c_str(), static_cast<char*>(nullptr));
         _exit(127);
     }
+    setpgid(pid, pid);
     view->childPid = pid;
+    view->childPgid = pid;
     return true;
 }
 
 // ---- wl_region ------------------------------------------------------------
 
+static void regionResourceDestroyed(wl_resource* resource) {
+    delete static_cast<RegionData*>(wl_resource_get_user_data(resource));
+}
 static void regionDestroy(wl_client*, wl_resource* resource) { wl_resource_destroy(resource); }
-static void regionAdd(wl_client*, wl_resource*, int32_t, int32_t, int32_t, int32_t) {}
-static void regionSubtract(wl_client*, wl_resource*, int32_t, int32_t, int32_t, int32_t) {}
+static void regionAdd(wl_client*, wl_resource* resource, int32_t x, int32_t y,
+                      int32_t width, int32_t height) {
+    if (width <= 0 || height <= 0) return;
+    auto* region = static_cast<RegionData*>(wl_resource_get_user_data(resource));
+    if (!region) return;
+    region->rects.push_back({x, y, width, height});
+}
+static void regionSubtract(wl_client*, wl_resource* resource, int32_t x, int32_t y,
+                           int32_t width, int32_t height) {
+    if (width <= 0 || height <= 0) return;
+    auto* region = static_cast<RegionData*>(wl_resource_get_user_data(resource));
+    if (!region) return;
+    std::vector<RegionRect> next;
+    const int sx0 = x, sy0 = y, sx1 = x + width, sy1 = y + height;
+    for (const auto& r : region->rects) {
+        const int rx0 = r.x, ry0 = r.y, rx1 = r.x + r.width, ry1 = r.y + r.height;
+        const int ix0 = std::max(rx0, sx0), iy0 = std::max(ry0, sy0);
+        const int ix1 = std::min(rx1, sx1), iy1 = std::min(ry1, sy1);
+        if (ix0 >= ix1 || iy0 >= iy1) {
+            next.push_back(r);
+            continue;
+        }
+        if (ry0 < iy0) next.push_back({rx0, ry0, r.width, iy0 - ry0});
+        if (iy1 < ry1) next.push_back({rx0, iy1, r.width, ry1 - iy1});
+        if (rx0 < ix0) next.push_back({rx0, iy0, ix0 - rx0, iy1 - iy0});
+        if (ix1 < rx1) next.push_back({ix1, iy0, rx1 - ix1, iy1 - iy0});
+    }
+    region->rects = std::move(next);
+}
 
 // ---- wl_surface -----------------------------------------------------------
 
@@ -1200,7 +1511,18 @@ static void destroySurfaceResource(wl_resource* resource) {
     if (!surface) return;
     auto* view = surface->view;
     if (view->pointerFocus == surface) view->pointerFocus = nullptr;
-    if (view->keyboardFocus == surface) view->keyboardFocus = nullptr;
+    if (view->pointerImplicitGrab == surface) {
+        view->pointerImplicitGrab = nullptr;
+        view->pressedPointerButtons = 0;
+    }
+    if (view->keyboardFocus == surface) {
+        for (auto* input : view->textInputs) {
+            if (input && input->focus == surface) input->focus = nullptr;
+        }
+        view->keyboardFocus = nullptr;
+        updateHostTextInputState(view);
+    }
+    if (view->popupGrab && isDescendantOf(view->popupGrab, surface)) view->popupGrab = nullptr;
     if (view->cursorSurface == surface) resetHostCursor(view);
     if (surface->viewport) {
         wl_resource_set_user_data(surface->viewport, nullptr);
@@ -1242,7 +1564,17 @@ static void surfaceFrame(wl_client* client, wl_resource* resource, uint32_t id) 
 }
 
 static void surfaceSetOpaque(wl_client*, wl_resource*, wl_resource*) {}
-static void surfaceSetInput(wl_client*, wl_resource*, wl_resource*) {}
+static void surfaceSetInput(wl_client*, wl_resource* resource, wl_resource* regionResource) {
+    auto* surface = surfaceFromResource(resource);
+    if (!surface) return;
+    if (!regionResource) {
+        surface->pendingInputRegion = InputRegionState{};
+        return;
+    }
+    auto* region = static_cast<RegionData*>(wl_resource_get_user_data(regionResource));
+    surface->pendingInputRegion.defaultRegion = false;
+    surface->pendingInputRegion.rects = region ? region->rects : std::vector<RegionRect>{};
+}
 
 static bool isEffectivelySynchronized(const Surface* surface) {
     if (!surface || !surface->subsurface || !surface->parent) return false;
@@ -1283,6 +1615,7 @@ static void applyPendingSurfaceState(Surface* surface) {
     surface->transform = surface->pendingTransform;
     surface->viewportState = surface->pendingViewportState;
     surface->windowGeometry = surface->pendingWindowGeometry;
+    surface->inputRegion = surface->pendingInputRegion;
     moveCallbacks(surface->pendingFrameCallbacks, surface->frameCallbacks);
     surface->dirty = true;
     if (surface->mapped) sendOutputEnter(surface);
@@ -1305,6 +1638,7 @@ static void cachePendingSurfaceState(Surface* surface) {
     surface->cachedTransform = surface->pendingTransform;
     surface->cachedViewportState = surface->pendingViewportState;
     surface->cachedWindowGeometry = surface->pendingWindowGeometry;
+    surface->cachedInputRegion = surface->pendingInputRegion;
     moveCallbacks(surface->pendingFrameCallbacks, surface->cachedFrameCallbacks);
     surface->hasCachedCommit = true;
 }
@@ -1318,6 +1652,7 @@ static void applyCachedSurfaceState(Surface* surface) {
     surface->transform = surface->cachedTransform;
     surface->viewportState = surface->cachedViewportState;
     surface->windowGeometry = surface->cachedWindowGeometry;
+    surface->inputRegion = surface->cachedInputRegion;
     moveCallbacks(surface->cachedFrameCallbacks, surface->frameCallbacks);
     surface->hasCachedCommit = false;
     surface->dirty = true;
@@ -1396,7 +1731,8 @@ static void compositorCreateRegion(wl_client* client, wl_resource*, uint32_t id)
         wl_client_post_no_memory(client);
         return;
     }
-    wl_resource_set_implementation(region, &g_regionImpl, nullptr, nullptr);
+    auto* data = new RegionData();
+    wl_resource_set_implementation(region, &g_regionImpl, data, regionResourceDestroyed);
 }
 
 static void compositorRelease(wl_client*, wl_resource* resource) { wl_resource_destroy(resource); }
@@ -1429,8 +1765,20 @@ static void subsurfaceSetPosition(wl_client*, wl_resource* resource, int32_t x, 
         surface->hasPendingPosition = true;
     }
 }
-static void subsurfacePlaceAbove(wl_client*, wl_resource*, wl_resource*) {}
-static void subsurfacePlaceBelow(wl_client*, wl_resource*, wl_resource*) {}
+static void subsurfacePlaceAbove(wl_client*, wl_resource* resource, wl_resource* siblingResource) {
+    auto* surface = surfaceFromResource(resource);
+    auto* sibling = surfaceFromResource(siblingResource);
+    if (!surface || !sibling) return;
+    if (sibling != surface->parent && sibling->parent != surface->parent) return;
+    moveSurfaceRelative(surface, sibling, true);
+}
+static void subsurfacePlaceBelow(wl_client*, wl_resource* resource, wl_resource* siblingResource) {
+    auto* surface = surfaceFromResource(resource);
+    auto* sibling = surfaceFromResource(siblingResource);
+    if (!surface || !sibling) return;
+    if (sibling != surface->parent && sibling->parent != surface->parent) return;
+    moveSurfaceRelative(surface, sibling, false);
+}
 static void subsurfaceSetSync(wl_client*, wl_resource* resource) {
     if (auto* surface = surfaceFromResource(resource)) surface->synchronized = true;
 }
@@ -1460,6 +1808,10 @@ static void subcompositorGetSubsurface(wl_client* client, wl_resource*, uint32_t
         return;
     }
     wl_resource_set_implementation(surface->subsurface, &g_subsurfaceImpl, surface, subsurfaceResourceDestroyed);
+    // A newly created wl_subsurface is stacked immediately above its parent.
+    // Clients such as Firefox may create the child wl_surface before they create
+    // the popup parent, so creation order alone cannot represent this rule.
+    moveSurfaceRelative(surface, parent, true);
 }
 
 static void bindSubcompositor(wl_client* client, void* data, uint32_t version, uint32_t id) {
@@ -1628,7 +1980,11 @@ static void positionerSetAnchor(wl_client*, wl_resource* resource, uint32_t anch
 static void positionerSetGravity(wl_client*, wl_resource* resource, uint32_t gravity) {
     if (auto* p = static_cast<Positioner*>(wl_resource_get_user_data(resource))) p->gravity = gravity;
 }
-static void positionerSetConstraint(wl_client*, wl_resource*, uint32_t) {}
+static void positionerSetConstraint(wl_client*, wl_resource* resource, uint32_t adjustment) {
+    if (auto* p = static_cast<Positioner*>(wl_resource_get_user_data(resource))) {
+        p->constraintAdjustment = adjustment;
+    }
+}
 static void positionerSetOffset(wl_client*, wl_resource* resource, int32_t x, int32_t y) {
     if (auto* p = static_cast<Positioner*>(wl_resource_get_user_data(resource))) {
         p->offsetX = x; p->offsetY = y;
@@ -1695,10 +2051,20 @@ static void xdgSurfaceGetToplevel(wl_client* client, wl_resource* resource, uint
 }
 
 static void popupResourceDestroyed(wl_resource* resource) {
-    if (auto* surface = surfaceFromResource(resource)) surface->xdgPopup = nullptr;
+    if (auto* surface = surfaceFromResource(resource)) {
+        if (surface->view->popupGrab && isDescendantOf(surface->view->popupGrab, surface)) {
+            surface->view->popupGrab = nullptr;
+        }
+        surface->xdgPopup = nullptr;
+    }
 }
 static void popupDestroy(wl_client*, wl_resource* resource) { wl_resource_destroy(resource); }
-static void popupGrab(wl_client*, wl_resource*, wl_resource*, uint32_t) {}
+static void popupGrab(wl_client*, wl_resource* resource, wl_resource*, uint32_t) {
+    auto* surface = surfaceFromResource(resource);
+    if (!surface || !surface->view) return;
+    surface->view->popupGrab = surface;
+    raiseSurface(surface);
+}
 static void popupReposition(wl_client*, wl_resource* resource, wl_resource* positionerResource,
                             uint32_t token) {
     auto* surface = surfaceFromResource(resource);
@@ -1781,6 +2147,65 @@ static void bindXdgWmBase(wl_client* client, void* data, uint32_t version, uint3
     wl_resource_set_implementation(resource, &g_xdgWmBaseImpl, data, nullptr);
 }
 
+// ---- xdg-decoration --------------------------------------------------------
+
+static void decorationResourceDestroyed(wl_resource* resource) {
+    if (auto* surface = surfaceFromResource(resource)) surface->xdgDecoration = nullptr;
+}
+
+static void decorationManagerDestroy(wl_client*, wl_resource* resource) {
+    wl_resource_destroy(resource);
+}
+
+static void toplevelDecorationDestroy(wl_client*, wl_resource* resource) {
+    wl_resource_destroy(resource);
+}
+
+static void configureServerSideDecoration(Surface* surface) {
+    if (!surface || !surface->xdgDecoration) return;
+    zxdg_toplevel_decoration_v1_send_configure(
+        surface->xdgDecoration, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+    if (surface->xdgToplevel) sendToplevelConfigure(surface);
+}
+
+static void toplevelDecorationSetMode(wl_client*, wl_resource* resource, uint32_t) {
+    configureServerSideDecoration(surfaceFromResource(resource));
+}
+
+static void toplevelDecorationUnsetMode(wl_client*, wl_resource* resource) {
+    configureServerSideDecoration(surfaceFromResource(resource));
+}
+
+static void decorationManagerGetToplevelDecoration(wl_client* client, wl_resource* resource,
+                                                    uint32_t id, wl_resource* toplevelResource) {
+    auto* surface = surfaceFromResource(toplevelResource);
+    if (!surface || !surface->xdgToplevel) return;
+    if (surface->xdgDecoration) {
+        wl_resource_post_error(resource, ZXDG_TOPLEVEL_DECORATION_V1_ERROR_ALREADY_CONSTRUCTED,
+                               "xdg_toplevel already has a decoration object");
+        return;
+    }
+    surface->xdgDecoration = wl_resource_create(
+        client, &zxdg_toplevel_decoration_v1_interface, std::min(wl_resource_get_version(resource), 1), id);
+    if (!surface->xdgDecoration) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    wl_resource_set_implementation(surface->xdgDecoration, &g_toplevelDecorationImpl, surface,
+                                   decorationResourceDestroyed);
+    configureServerSideDecoration(surface);
+}
+
+static void bindDecorationManager(wl_client* client, void* data, uint32_t version, uint32_t id) {
+    wl_resource* resource = wl_resource_create(
+        client, &zxdg_decoration_manager_v1_interface, std::min(version, 1u), id);
+    if (!resource) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    wl_resource_set_implementation(resource, &g_decorationManagerImpl, data, nullptr);
+}
+
 // ---- wl_output ------------------------------------------------------------
 
 static void outputResourceDestroyed(wl_resource* resource) {
@@ -1792,6 +2217,28 @@ static void outputResourceDestroyed(wl_resource* resource) {
 }
 static void outputRelease(wl_client*, wl_resource* resource) { wl_resource_destroy(resource); }
 
+static void sendOutputState(AppView* view, wl_resource* resource) {
+    if (!view || !resource) return;
+    const uint32_t version = wl_resource_get_version(resource);
+    wl_output_send_geometry(resource, 0, 0, 340, 190, WL_OUTPUT_SUBPIXEL_UNKNOWN,
+                            "wayland-appview", "embedded-output", WL_OUTPUT_TRANSFORM_NORMAL);
+    wl_output_send_mode(resource, WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED,
+                        view->hostWidth, view->hostHeight, 240000);
+    if (version >= 2) {
+        wl_output_send_scale(resource, std::max(1, static_cast<int>(std::lround(view->density))));
+    }
+    if (version >= 4) {
+        wl_output_send_name(resource, "APPVIEW-1");
+        wl_output_send_description(resource, "Wayland AppView embedded output");
+    }
+    if (version >= 2) wl_output_send_done(resource);
+}
+
+static void broadcastOutputState(AppView* view) {
+    if (!view) return;
+    for (auto& output : view->outputs) sendOutputState(view, output.resource);
+}
+
 static void bindOutput(wl_client* client, void* data, uint32_t version, uint32_t id) {
     auto* view = static_cast<AppView*>(data);
     const uint32_t v = std::min(version, 4u);
@@ -1802,19 +2249,7 @@ static void bindOutput(wl_client* client, void* data, uint32_t version, uint32_t
     }
     wl_resource_set_implementation(resource, &g_outputImpl, view, outputResourceDestroyed);
     view->outputs.push_back({client, resource});
-    wl_output_send_geometry(resource, 0, 0, 340, 190, WL_OUTPUT_SUBPIXEL_UNKNOWN,
-                            "wayland-appview", "embedded-output", WL_OUTPUT_TRANSFORM_NORMAL);
-    wl_output_send_mode(resource, WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED,
-                        view->hostWidth, view->hostHeight, 240000);
-    if (v >= 2) {
-        wl_output_send_scale(resource, std::max(1, static_cast<int>(std::lround(view->density))));
-        wl_output_send_done(resource);
-    }
-    if (v >= 4) {
-        wl_output_send_name(resource, "APPVIEW-1");
-        wl_output_send_description(resource, "Wayland AppView embedded output");
-        wl_output_send_done(resource);
-    }
+    sendOutputState(view, resource);
 }
 
 // ---- wl_seat / input ------------------------------------------------------
@@ -1842,11 +2277,7 @@ static void pointerSetCursor(wl_client*, wl_resource* resource, uint32_t,
     auto* view = static_cast<AppView*>(wl_resource_get_user_data(resource));
     if (!view) return;
     if (!surfaceResource) {
-        view->cursorSurface = nullptr;
-        if (view->customCursor) {
-            SDL_DestroyCursor(view->customCursor);
-            view->customCursor = nullptr;
-        }
+        resetHostCursor(view);
         SDL_HideCursor();
         return;
     }
@@ -1907,7 +2338,7 @@ static void bindSeat(wl_client* client, void* data, uint32_t version, uint32_t i
         wl_client_post_no_memory(client);
         return;
     }
-    view->seats.push_back({client, resource, nullptr, nullptr});
+    view->seats.push_back({client, resource, nullptr, nullptr, nullptr});
     wl_resource_set_implementation(resource, &g_seatImpl, view, seatResourceDestroyed);
     wl_seat_send_capabilities(resource, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
     if (v >= 2) wl_seat_send_name(resource, "appview-seat");
@@ -1915,34 +2346,203 @@ static void bindSeat(wl_client* client, void* data, uint32_t version, uint32_t i
 
 // ---- wl_data_device_manager ----------------------------------------------
 
-static void dataSourceOffer(wl_client*, wl_resource*, const char*) {}
+static bool isTextMime(const std::string& mime) {
+    return mime == "text/plain;charset=utf-8" || mime == "text/plain" ||
+           mime == "UTF8_STRING" || mime == "STRING";
+}
+
+static const char* preferredTextMime(const DataSource* source) {
+    if (!source) return nullptr;
+    static constexpr const char* preferred[] = {
+        "text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING",
+    };
+    for (const char* candidate : preferred) {
+        if (std::find(source->mimeTypes.begin(), source->mimeTypes.end(), candidate) != source->mimeTypes.end()) {
+            return candidate;
+        }
+    }
+    return nullptr;
+}
+
+static std::string readDataSourceText(DataSource* source) {
+    const char* mime = preferredTextMime(source);
+    if (!source || !source->resource || !mime) return {};
+    int fds[2] = {-1, -1};
+    if (pipe(fds) != 0) return {};
+    fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+    fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+    wl_data_source_send_send(source->resource, mime, fds[1]);
+    wl_display_flush_clients(source->view->display);
+    close(fds[1]);
+    fds[1] = -1;
+
+    std::string result;
+    char buffer[4096];
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(750);
+    while (std::chrono::steady_clock::now() < deadline && result.size() < 16 * 1024 * 1024) {
+        pollfd descriptor{fds[0], POLLIN | POLLHUP, 0};
+        const int remaining = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count());
+        const int ready = poll(&descriptor, 1, std::max(1, remaining));
+        if (ready <= 0) break;
+        if (descriptor.revents & POLLIN) {
+            const ssize_t count = read(fds[0], buffer, sizeof(buffer));
+            if (count > 0) result.append(buffer, static_cast<size_t>(count));
+            else break;
+        }
+        if (descriptor.revents & POLLHUP) {
+            while (true) {
+                const ssize_t count = read(fds[0], buffer, sizeof(buffer));
+                if (count <= 0) break;
+                result.append(buffer, static_cast<size_t>(count));
+            }
+            break;
+        }
+    }
+    close(fds[0]);
+    return result;
+}
+
+static void dataOfferAccept(wl_client*, wl_resource*, uint32_t, const char*) {}
+static void dataOfferDestroy(wl_client*, wl_resource* resource) { wl_resource_destroy(resource); }
+static void dataOfferFinish(wl_client*, wl_resource*) {}
+static void dataOfferSetActions(wl_client*, wl_resource*, uint32_t, uint32_t) {}
+
+static void dataOfferReceive(wl_client*, wl_resource* resource, const char* mimeType, int32_t fd) {
+    auto* offer = static_cast<DataOffer*>(wl_resource_get_user_data(resource));
+    if (!offer || !offer->view || !mimeType || !isTextMime(mimeType)) {
+        close(fd);
+        return;
+    }
+    char* clipboard = SDL_GetClipboardText();
+    const char* text = clipboard ? clipboard : "";
+    size_t remaining = std::strlen(text);
+    const char* cursor = text;
+    while (remaining > 0) {
+        const ssize_t written = write(fd, cursor, remaining);
+        if (written <= 0) break;
+        cursor += written;
+        remaining -= static_cast<size_t>(written);
+    }
+    if (clipboard) SDL_free(clipboard);
+    close(fd);
+}
+
+static void dataOfferResourceDestroyed(wl_resource* resource) {
+    delete static_cast<DataOffer*>(wl_resource_get_user_data(resource));
+}
+
+static wl_resource* createClipboardOffer(AppView* view, wl_resource* device) {
+    if (!view || !device) return nullptr;
+    wl_client* client = wl_resource_get_client(device);
+    auto* offer = new DataOffer{view, nullptr};
+    offer->resource = wl_resource_create(client, &wl_data_offer_interface,
+                                         std::min(wl_resource_get_version(device), 3), 0);
+    if (!offer->resource) {
+        delete offer;
+        wl_client_post_no_memory(client);
+        return nullptr;
+    }
+    wl_resource_set_implementation(offer->resource, &g_dataOfferImpl, offer, dataOfferResourceDestroyed);
+    wl_data_device_send_data_offer(device, offer->resource);
+    wl_data_offer_send_offer(offer->resource, "text/plain;charset=utf-8");
+    wl_data_offer_send_offer(offer->resource, "text/plain");
+    wl_data_offer_send_offer(offer->resource, "UTF8_STRING");
+    return offer->resource;
+}
+
+static void sendClipboardSelectionToClient(AppView* view, wl_client* client) {
+    if (!view || !client) return;
+    for (auto& seat : view->seats) {
+        if (seat.client != client || !seat.dataDevice) continue;
+        wl_resource* offer = createClipboardOffer(view, seat.dataDevice);
+        wl_data_device_send_selection(seat.dataDevice, offer);
+    }
+}
+
+static void broadcastClipboardSelection(AppView* view) {
+    if (!view || !view->keyboardFocus || !view->keyboardFocus->resource) return;
+    sendClipboardSelectionToClient(view, wl_resource_get_client(view->keyboardFocus->resource));
+}
+
+static void dataSourceResourceDestroyed(wl_resource* resource) {
+    auto* source = static_cast<DataSource*>(wl_resource_get_user_data(resource));
+    if (!source) return;
+    if (source->view && source->view->selectionSource == resource) source->view->selectionSource = nullptr;
+    delete source;
+}
+
+static void dataSourceOffer(wl_client*, wl_resource* resource, const char* mimeType) {
+    auto* source = static_cast<DataSource*>(wl_resource_get_user_data(resource));
+    if (!source || !mimeType) return;
+    source->mimeTypes.emplace_back(mimeType);
+}
 static void dataSourceDestroy(wl_client*, wl_resource* resource) { wl_resource_destroy(resource); }
 static void dataSourceSetActions(wl_client*, wl_resource*, uint32_t) {}
 
 static void dataDeviceStartDrag(wl_client*, wl_resource*, wl_resource*, wl_resource*,
                                 wl_resource*, uint32_t) {}
-static void dataDeviceSetSelection(wl_client*, wl_resource*, wl_resource*, uint32_t) {}
+
+static void dataDeviceSetSelection(wl_client*, wl_resource* device, wl_resource* sourceResource,
+                                   uint32_t) {
+    auto* view = static_cast<AppView*>(wl_resource_get_user_data(device));
+    if (!view) return;
+    if (!sourceResource) {
+        if (view->selectionSource) wl_data_source_send_cancelled(view->selectionSource);
+        view->selectionSource = nullptr;
+        view->clipboardText.clear();
+        SDL_SetClipboardText("");
+        broadcastClipboardSelection(view);
+        return;
+    }
+    auto* source = static_cast<DataSource*>(wl_resource_get_user_data(sourceResource));
+    if (!source) return;
+    if (view->selectionSource && view->selectionSource != sourceResource) {
+        wl_data_source_send_cancelled(view->selectionSource);
+    }
+    view->selectionSource = sourceResource;
+    std::string text = readDataSourceText(source);
+    view->clipboardText = text;
+    SDL_SetClipboardText(text.c_str());
+    broadcastClipboardSelection(view);
+}
+
+static void dataDeviceResourceDestroyed(wl_resource* resource) {
+    auto* view = static_cast<AppView*>(wl_resource_get_user_data(resource));
+    if (!view) return;
+    for (auto& seat : view->seats) if (seat.dataDevice == resource) seat.dataDevice = nullptr;
+}
 static void dataDeviceRelease(wl_client*, wl_resource* resource) { wl_resource_destroy(resource); }
 
 static void dataDeviceManagerCreateSource(wl_client* client, wl_resource* resource, uint32_t id) {
-    wl_resource* source = wl_resource_create(
+    auto* view = static_cast<AppView*>(wl_resource_get_user_data(resource));
+    auto* source = new DataSource{view, nullptr, {}};
+    source->resource = wl_resource_create(
         client, &wl_data_source_interface, std::min(wl_resource_get_version(resource), 3), id);
-    if (!source) {
+    if (!source->resource) {
+        delete source;
         wl_client_post_no_memory(client);
         return;
     }
-    wl_resource_set_implementation(source, &g_dataSourceImpl, nullptr, nullptr);
+    wl_resource_set_implementation(source->resource, &g_dataSourceImpl, source, dataSourceResourceDestroyed);
 }
 
 static void dataDeviceManagerGetDevice(wl_client* client, wl_resource* resource, uint32_t id,
-                                       wl_resource*) {
+                                       wl_resource* seatResource) {
+    auto* view = static_cast<AppView*>(wl_resource_get_user_data(resource));
     wl_resource* device = wl_resource_create(
         client, &wl_data_device_interface, std::min(wl_resource_get_version(resource), 3), id);
     if (!device) {
         wl_client_post_no_memory(client);
         return;
     }
-    wl_resource_set_implementation(device, &g_dataDeviceImpl, nullptr, nullptr);
+    wl_resource_set_implementation(device, &g_dataDeviceImpl, view, dataDeviceResourceDestroyed);
+    if (auto* seat = seatBindingForSeatResource(view, seatResource)) seat->dataDevice = device;
+    if (view->keyboardFocus && view->keyboardFocus->resource &&
+        wl_resource_get_client(view->keyboardFocus->resource) == client) {
+        wl_resource* offer = createClipboardOffer(view, device);
+        wl_data_device_send_selection(device, offer);
+    }
 }
 
 static void dataDeviceManagerRelease(wl_client*, wl_resource* resource) {
@@ -1957,6 +2557,240 @@ static void bindDataDeviceManager(wl_client* client, void* data, uint32_t versio
         return;
     }
     wl_resource_set_implementation(resource, &g_dataDeviceManagerImpl, data, nullptr);
+}
+
+static void pollHostClipboard(AppView* view) {
+    if (!view) return;
+    const uint32_t now = nowMs();
+    if (now - view->lastClipboardPollMs < 500) return;
+    view->lastClipboardPollMs = now;
+    char* clipboard = SDL_GetClipboardText();
+    std::string text = clipboard ? clipboard : "";
+    if (clipboard) SDL_free(clipboard);
+    if (text == view->clipboardText) return;
+    if (view->selectionSource) {
+        wl_data_source_send_cancelled(view->selectionSource);
+        view->selectionSource = nullptr;
+    }
+    view->clipboardText = std::move(text);
+    broadcastClipboardSelection(view);
+}
+
+// ---- zwp_text_input_v3 ----------------------------------------------------
+
+static bool textInputIsActive(const TextInput* input) {
+    return input && input->enabled && input->focus && input->view &&
+           input->view->keyboardFocus == input->focus;
+}
+
+static void updateHostTextInputState(AppView* view) {
+    if (!view) return;
+    TextInput* active = nullptr;
+    for (auto* input : view->textInputs) {
+        if (textInputIsActive(input)) {
+            active = input;
+            break;
+        }
+    }
+    view->textInputWatchActive.store(active != nullptr, std::memory_order_release);
+    SDL_Window* window = SDL_GetKeyboardFocus();
+    view->textInputWindowId.store(window ? SDL_GetWindowID(window) : 0, std::memory_order_release);
+    if (!window) return;
+    if (!active) {
+        if (SDL_TextInputActive(window)) SDL_StopTextInput(window);
+        return;
+    }
+    if (!SDL_TextInputActive(window)) SDL_StartTextInput(window);
+    if (active->cursorWidth > 0 || active->cursorHeight > 0) {
+        auto [surfaceX, surfaceY] = absolutePosition(active->focus);
+        SDL_Rect rect{
+            static_cast<int>(std::lround((surfaceX + active->cursorX) * view->density)),
+            static_cast<int>(std::lround((surfaceY + active->cursorY) * view->density)),
+            std::max(1, static_cast<int>(std::lround(active->cursorWidth * view->density))),
+            std::max(1, static_cast<int>(std::lround(active->cursorHeight * view->density))),
+        };
+        SDL_SetTextInputArea(window, &rect, 0);
+    }
+}
+
+static void updateTextInputFocus(AppView* view, Surface* oldSurface, Surface* newSurface) {
+    if (!view) return;
+    for (auto* input : view->textInputs) {
+        if (!input || !input->resource) continue;
+        wl_client* client = wl_resource_get_client(input->resource);
+        if (input->focus && oldSurface == input->focus) {
+            zwp_text_input_v3_send_leave(input->resource, input->focus->resource);
+            input->focus = nullptr;
+        }
+        if (newSurface && newSurface->resource && wl_resource_get_client(newSurface->resource) == client) {
+            input->focus = newSurface;
+            zwp_text_input_v3_send_enter(input->resource, newSurface->resource);
+        }
+    }
+    updateHostTextInputState(view);
+}
+
+static void textInputDestroy(wl_client*, wl_resource* resource) { wl_resource_destroy(resource); }
+static void textInputEnable(wl_client*, wl_resource* resource) {
+    if (auto* input = static_cast<TextInput*>(wl_resource_get_user_data(resource))) {
+        input->pendingEnabled = true;
+    }
+}
+static void textInputDisable(wl_client*, wl_resource* resource) {
+    if (auto* input = static_cast<TextInput*>(wl_resource_get_user_data(resource))) {
+        input->pendingEnabled = false;
+    }
+}
+static void textInputSetSurroundingText(wl_client*, wl_resource* resource, const char* text,
+                                        int32_t cursor, int32_t anchor) {
+    if (auto* input = static_cast<TextInput*>(wl_resource_get_user_data(resource))) {
+        input->surroundingText = text ? text : "";
+        input->cursor = cursor;
+        input->anchor = anchor;
+    }
+}
+static void textInputSetTextChangeCause(wl_client*, wl_resource*, uint32_t) {}
+static void textInputSetContentType(wl_client*, wl_resource*, uint32_t, uint32_t) {}
+static void textInputSetCursorRectangle(wl_client*, wl_resource* resource, int32_t x, int32_t y,
+                                        int32_t width, int32_t height) {
+    if (auto* input = static_cast<TextInput*>(wl_resource_get_user_data(resource))) {
+        input->cursorX = x;
+        input->cursorY = y;
+        input->cursorWidth = width;
+        input->cursorHeight = height;
+    }
+}
+static void textInputCommit(wl_client*, wl_resource* resource) {
+    auto* input = static_cast<TextInput*>(wl_resource_get_user_data(resource));
+    if (!input) return;
+    input->enabled = input->pendingEnabled;
+    input->commitSerial++;
+    updateHostTextInputState(input->view);
+}
+static void textInputSetAvailableActions(wl_client*, wl_resource*, wl_array*) {}
+static void textInputShowInputPanel(wl_client*, wl_resource* resource) {
+    if (auto* input = static_cast<TextInput*>(wl_resource_get_user_data(resource))) {
+        updateHostTextInputState(input->view);
+    }
+}
+static void textInputHideInputPanel(wl_client*, wl_resource* resource) {
+    auto* input = static_cast<TextInput*>(wl_resource_get_user_data(resource));
+    if (!input || !input->view) return;
+    if (SDL_Window* window = SDL_GetKeyboardFocus()) SDL_StopTextInput(window);
+}
+
+static void textInputResourceDestroyed(wl_resource* resource) {
+    auto* input = static_cast<TextInput*>(wl_resource_get_user_data(resource));
+    if (!input) return;
+    AppView* view = input->view;
+    if (view) {
+        view->textInputs.erase(std::remove(view->textInputs.begin(), view->textInputs.end(), input),
+                               view->textInputs.end());
+    }
+    delete input;
+    updateHostTextInputState(view);
+}
+
+static void textInputManagerDestroy(wl_client*, wl_resource* resource) { wl_resource_destroy(resource); }
+static void textInputManagerGetTextInput(wl_client* client, wl_resource* manager, uint32_t id,
+                                         wl_resource* seatResource) {
+    auto* view = static_cast<AppView*>(wl_resource_get_user_data(manager));
+    auto* input = new TextInput();
+    input->view = view;
+    input->seat = seatResource;
+    input->resource = wl_resource_create(client, &zwp_text_input_v3_interface,
+                                         std::min(wl_resource_get_version(manager), 1), id);
+    if (!input->resource) {
+        delete input;
+        wl_client_post_no_memory(client);
+        return;
+    }
+    wl_resource_set_implementation(input->resource, &g_textInputImpl, input, textInputResourceDestroyed);
+    view->textInputs.push_back(input);
+    if (view->keyboardFocus && view->keyboardFocus->resource &&
+        wl_resource_get_client(view->keyboardFocus->resource) == client) {
+        input->focus = view->keyboardFocus;
+        zwp_text_input_v3_send_enter(input->resource, input->focus->resource);
+    }
+}
+
+static void bindTextInputManager(wl_client* client, void* data, uint32_t version, uint32_t id) {
+    wl_resource* resource = wl_resource_create(client, &zwp_text_input_manager_v3_interface,
+                                               std::min(version, 1u), id);
+    if (!resource) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    wl_resource_set_implementation(resource, &g_textInputManagerImpl, data, nullptr);
+}
+
+static int utf8ByteOffsetForCharacters(const std::string& text, int characters) {
+    if (characters < 0) return -1;
+    size_t offset = 0;
+    int consumed = 0;
+    while (offset < text.size() && consumed < characters) {
+        const unsigned char lead = static_cast<unsigned char>(text[offset]);
+        size_t width = 1;
+        if ((lead & 0xe0u) == 0xc0u) width = 2;
+        else if ((lead & 0xf0u) == 0xe0u) width = 3;
+        else if ((lead & 0xf8u) == 0xf0u) width = 4;
+        offset = std::min(text.size(), offset + width);
+        consumed++;
+    }
+    return static_cast<int>(offset);
+}
+
+static bool SDLCALL appViewEventWatch(void* userdata, SDL_Event* event) {
+    auto* view = static_cast<AppView*>(userdata);
+    if (!view || !event || !view->textInputWatchActive.load(std::memory_order_acquire)) return true;
+    const SDL_WindowID expectedWindow = view->textInputWindowId.load(std::memory_order_acquire);
+    PendingTextEvent pending;
+    if (event->type == SDL_EVENT_TEXT_EDITING) {
+        if (expectedWindow && event->edit.windowID != expectedWindow) return true;
+        pending.type = PendingTextEventType::Preedit;
+        pending.text = event->edit.text ? event->edit.text : "";
+        pending.cursorBeginCharacters = event->edit.start;
+        pending.cursorEndCharacters = event->edit.start < 0 || event->edit.length < 0
+            ? -1
+            : event->edit.start + event->edit.length;
+    } else if (event->type == SDL_EVENT_TEXT_INPUT) {
+        if (expectedWindow && event->text.windowID != expectedWindow) return true;
+        pending.type = PendingTextEventType::Commit;
+        pending.text = event->text.text ? event->text.text : "";
+    } else {
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(view->textEventMutex);
+    view->pendingTextEvents.push_back(std::move(pending));
+    return true;
+}
+
+static void ensureAppViewEventWatch(AppView* view) {
+    if (!view || view->eventWatchInstalled) return;
+    if (SDL_AddEventWatch(appViewEventWatch, view)) view->eventWatchInstalled = true;
+}
+
+static void processPendingTextEvents(AppView* view) {
+    if (!view) return;
+    std::vector<PendingTextEvent> pending;
+    {
+        std::lock_guard<std::mutex> lock(view->textEventMutex);
+        pending.swap(view->pendingTextEvents);
+    }
+    for (const auto& event : pending) {
+        for (auto* input : view->textInputs) {
+            if (!textInputIsActive(input) || !input->resource) continue;
+            if (event.type == PendingTextEventType::Preedit) {
+                const int begin = utf8ByteOffsetForCharacters(event.text, event.cursorBeginCharacters);
+                const int end = utf8ByteOffsetForCharacters(event.text, event.cursorEndCharacters);
+                zwp_text_input_v3_send_preedit_string(input->resource, event.text.c_str(), begin, end);
+            } else {
+                zwp_text_input_v3_send_commit_string(input->resource, event.text.c_str());
+                zwp_text_input_v3_send_preedit_string(input->resource, nullptr, 0, 0);
+            }
+            zwp_text_input_v3_send_done(input->resource, input->commitSerial);
+        }
+    }
 }
 
 // ---- linux-dmabuf ---------------------------------------------------------
@@ -2116,6 +2950,12 @@ static void initializeInterfaces() {
     g_fractionalScaleManagerImpl.get_fractional_scale = fractionalScaleManagerGet;
     g_fractionalScaleImpl.destroy = fractionalScaleDestroy;
 
+    g_decorationManagerImpl.destroy = decorationManagerDestroy;
+    g_decorationManagerImpl.get_toplevel_decoration = decorationManagerGetToplevelDecoration;
+    g_toplevelDecorationImpl.destroy = toplevelDecorationDestroy;
+    g_toplevelDecorationImpl.set_mode = toplevelDecorationSetMode;
+    g_toplevelDecorationImpl.unset_mode = toplevelDecorationUnsetMode;
+
     g_xdgWmBaseImpl.destroy = xdgWmBaseDestroy;
     g_xdgWmBaseImpl.create_positioner = xdgWmBaseCreatePositioner;
     g_xdgWmBaseImpl.get_xdg_surface = xdgWmBaseGetSurface;
@@ -2175,6 +3015,25 @@ static void initializeInterfaces() {
     g_dataDeviceImpl.start_drag = dataDeviceStartDrag;
     g_dataDeviceImpl.set_selection = dataDeviceSetSelection;
     g_dataDeviceImpl.release = dataDeviceRelease;
+    g_dataOfferImpl.accept = dataOfferAccept;
+    g_dataOfferImpl.receive = dataOfferReceive;
+    g_dataOfferImpl.destroy = dataOfferDestroy;
+    g_dataOfferImpl.finish = dataOfferFinish;
+    g_dataOfferImpl.set_actions = dataOfferSetActions;
+
+    g_textInputManagerImpl.destroy = textInputManagerDestroy;
+    g_textInputManagerImpl.get_text_input = textInputManagerGetTextInput;
+    g_textInputImpl.destroy = textInputDestroy;
+    g_textInputImpl.enable = textInputEnable;
+    g_textInputImpl.disable = textInputDisable;
+    g_textInputImpl.set_surrounding_text = textInputSetSurroundingText;
+    g_textInputImpl.set_text_change_cause = textInputSetTextChangeCause;
+    g_textInputImpl.set_content_type = textInputSetContentType;
+    g_textInputImpl.set_cursor_rectangle = textInputSetCursorRectangle;
+    g_textInputImpl.commit = textInputCommit;
+    g_textInputImpl.set_available_actions = textInputSetAvailableActions;
+    g_textInputImpl.show_input_panel = textInputShowInputPanel;
+    g_textInputImpl.hide_input_panel = textInputHideInputPanel;
 
     g_dmaBufferImpl.destroy = dmaBufferDestroy;
     g_dmabufImpl.destroy = dmabufDestroy;
@@ -2224,9 +3083,14 @@ static bool initializeWayland(AppView* view) {
     view->viewporterGlobal = wl_global_create(view->display, &wp_viewporter_interface, 1, view, bindViewporter);
     view->fractionalScaleGlobal = wl_global_create(
         view->display, &wp_fractional_scale_manager_v1_interface, 1, view, bindFractionalScaleManager);
+    view->decorationGlobal = wl_global_create(
+        view->display, &zxdg_decoration_manager_v1_interface, 1, view, bindDecorationManager);
+    view->textInputGlobal = wl_global_create(
+        view->display, &zwp_text_input_manager_v3_interface, 1, view, bindTextInputManager);
     if (!view->compositorGlobal || !view->subcompositorGlobal || !view->xdgGlobal ||
         !view->outputGlobal || !view->seatGlobal || !view->dataDeviceGlobal ||
-        !view->viewporterGlobal || !view->fractionalScaleGlobal) {
+        !view->viewporterGlobal || !view->fractionalScaleGlobal || !view->decorationGlobal ||
+        !view->textInputGlobal) {
         setError(view, "failed to create one or more Wayland globals");
         return false;
     }
@@ -2247,7 +3111,13 @@ static void reapChild(AppView* view) {
     if (!view || view->childPid <= 0) return;
     int status = 0;
     pid_t result = waitpid(view->childPid, &status, WNOHANG);
-    if (result == view->childPid) view->childPid = -1;
+    if (result == view->childPid) {
+        view->childPid = -1;
+        if (view->childPgid > 0) {
+            kill(-view->childPgid, SIGTERM);
+            view->childPgid = -1;
+        }
+    }
 }
 
 } // namespace
@@ -2265,8 +3135,14 @@ extern "C" appview_t* appview_create(void) {
 extern "C" void appview_destroy(appview_t* opaque) {
     auto* view = static_cast<appview*>(opaque);
     if (!view) return;
+    view->textInputWatchActive.store(false, std::memory_order_release);
+    if (view->eventWatchInstalled) {
+        SDL_RemoveEventWatch(appViewEventWatch, view);
+        view->eventWatchInstalled = false;
+    }
     appview_terminate(view);
     if (view->cursorSurface || view->customCursor) resetHostCursor(view);
+    collectRetiredHostCursors(view, true);
     if (view->renderer.initialized) {
         glDeleteBuffers(1, &view->renderer.vbo);
         glDeleteVertexArrays(1, &view->renderer.vao);
@@ -2333,28 +3209,50 @@ extern "C" void appview_terminate(appview_t* opaque) {
     view->pendingCommand.clear();
     for (auto& surface : view->surfaces) surface->fullscreenRequested = false;
     if (view->cursorSurface || view->customCursor) resetHostCursor(view);
-    if (view->childPid > 0) {
-        kill(view->childPid, SIGTERM);
-        for (int i = 0; i < 20; ++i) {
-            int status = 0;
-            pid_t result = waitpid(view->childPid, &status, WNOHANG);
-            if (result == view->childPid) {
-                view->childPid = -1;
-                break;
+    if (view->childPid > 0 || view->childPgid > 0) {
+        const pid_t pgid = view->childPgid > 0 ? view->childPgid : view->childPid;
+        if (pgid > 0) kill(-pgid, SIGTERM);
+        if (view->childPid > 0) {
+            for (int i = 0; i < 30; ++i) {
+                int status = 0;
+                pid_t result = waitpid(view->childPid, &status, WNOHANG);
+                if (result == view->childPid) {
+                    view->childPid = -1;
+                    break;
+                }
+                usleep(10000);
             }
-            usleep(10000);
         }
         if (view->childPid > 0) {
-            kill(view->childPid, SIGKILL);
+            if (pgid > 0) kill(-pgid, SIGKILL);
             waitpid(view->childPid, nullptr, 0);
             view->childPid = -1;
         }
+        view->childPgid = -1;
     }
+    view->pointerFocus = nullptr;
+    view->pointerImplicitGrab = nullptr;
+    view->pressedPointerButtons = 0;
+    view->keyboardFocus = nullptr;
+    view->popupGrab = nullptr;
+    if (view->display) {
+        wl_display_destroy_clients(view->display);
+        wl_event_loop_dispatch(view->loop, 0);
+    }
+    view->surfaces.erase(
+        std::remove_if(view->surfaces.begin(), view->surfaces.end(),
+                       [](const auto& surface) { return !surface->resource; }),
+        view->surfaces.end());
+    view->title = "Embedded application";
+    view->sceneDirty = true;
 }
 
 extern "C" int appview_render(appview_t* opaque, int framebuffer, int width, int height, float density) {
     auto* view = static_cast<appview*>(opaque);
     if (!view || !view->display) return 0;
+    ++view->renderSequence;
+    collectRetiredHostCursors(view);
+    ensureAppViewEventWatch(view);
     const float newDensity = std::max(0.1f, density);
     const bool densityChanged = std::fabs(view->density - newDensity) > 0.001f;
     const bool sizeChanged = view->hostWidth != width || view->hostHeight != height || densityChanged;
@@ -2370,10 +3268,13 @@ extern "C" int appview_render(appview_t* opaque, int framebuffer, int width, int
     if (!view->dmabufGlobal) return 0;
     if (!spawnPendingChild(view)) return 0;
     wl_event_loop_dispatch(view->loop, 0);
+    processPendingTextEvents(view);
+    pollHostClipboard(view);
     wl_display_flush_clients(view->display);
     reapChild(view);
     if (sizeChanged) {
         view->sceneDirty = true;
+        broadcastOutputState(view);
         for (auto& surface : view->surfaces) {
             if (surface->xdgToplevel) sendToplevelConfigure(surface.get());
             if (densityChanged && surface->fractionalScale) {
@@ -2414,8 +3315,11 @@ extern "C" void appview_pointer_motion(appview_t* opaque, int x, int y, unsigned
 
     view->pointerX = x / view->density;
     view->pointerY = y / view->density;
-    Surface* target = hitTest(view, view->pointerX, view->pointerY);
-    updatePointerFocus(view, target, timeMs);
+    Surface* target =
+        view->pointerImplicitGrab && view->pointerImplicitGrab->resource
+            ? view->pointerImplicitGrab
+            : hitTest(view, view->pointerX, view->pointerY);
+    if (!view->pointerImplicitGrab) updatePointerFocus(view, target, timeMs);
     if (!target || !target->resource) return;
     wl_client* client = wl_resource_get_client(target->resource);
     auto [sx, sy] = absolutePosition(target);
@@ -2439,19 +3343,57 @@ extern "C" void appview_pointer_leave(appview_t* opaque) {
 extern "C" void appview_pointer_button(appview_t* opaque, int button, int pressed,
                                         unsigned int timeMs) {
     auto* view = static_cast<appview*>(opaque);
-    if (!view || !view->pointerFocus || !view->pointerFocus->resource) return;
+    if (!view) return;
+    const uint32_t eventTime = timeMs ? timeMs : nowMs();
+    const uint32_t buttonBit =
+        button == 2 ? (1u << 1) : button == 3 ? (1u << 2) : (1u << 0);
+    Surface* hit = hitTest(view, view->pointerX, view->pointerY);
+    Surface* target =
+        view->pointerImplicitGrab && view->pointerImplicitGrab->resource
+            ? view->pointerImplicitGrab
+            : hit;
+    if (pressed && view->popupGrab && (!target || !isDescendantOf(target, view->popupGrab))) {
+        Surface* popup = view->popupGrab;
+        view->popupGrab = nullptr;
+        if (popup->xdgPopup) xdg_popup_send_popup_done(popup->xdgPopup);
+        updatePointerFocus(view, target, eventTime);
+        wl_display_flush_clients(view->display);
+        return;
+    }
+    if (!view->pointerImplicitGrab && target != view->pointerFocus) {
+        updatePointerFocus(view, target, eventTime);
+    }
+    if (!view->pointerFocus || !view->pointerFocus->resource) return;
+    if (pressed && view->pressedPointerButtons == 0) {
+        view->pointerImplicitGrab = view->pointerFocus;
+    }
     wl_client* client = wl_resource_get_client(view->pointerFocus->resource);
     uint32_t linuxButton = BTN_LEFT;
     if (button == 2) linuxButton = BTN_MIDDLE;
     else if (button == 3) linuxButton = BTN_RIGHT;
     for (auto& seat : view->seats) {
         if (seat.client != client || !seat.pointer) continue;
-        wl_pointer_send_button(seat.pointer, nextSerial(view), timeMs ? timeMs : nowMs(), linuxButton,
+        wl_pointer_send_button(seat.pointer, nextSerial(view), eventTime, linuxButton,
                                pressed ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED);
         if (wl_resource_get_version(seat.pointer) >= WL_POINTER_FRAME_SINCE_VERSION)
             wl_pointer_send_frame(seat.pointer);
     }
-    if (pressed) updateKeyboardFocus(view, view->pointerFocus);
+    if (pressed) {
+        view->pressedPointerButtons |= buttonBit;
+        // Pointer interaction inside an xdg_popup must not steal keyboard/IME
+        // focus from the owning toplevel. Firefox destroys its context menu
+        // immediately if the compositor enters keyboard focus on the popup.
+        if (!isInPopupTree(view->pointerFocus)) {
+            updateKeyboardFocus(view, keyboardFocusTarget(view->pointerFocus));
+        }
+    } else {
+        view->pressedPointerButtons &= ~buttonBit;
+        if (view->pressedPointerButtons == 0) {
+            view->pointerImplicitGrab = nullptr;
+            Surface* next = hitTest(view, view->pointerX, view->pointerY);
+            if (next != view->pointerFocus) updatePointerFocus(view, next, eventTime);
+        }
+    }
     wl_display_flush_clients(view->display);
 }
 
@@ -2509,4 +3451,51 @@ extern "C" void appview_set_focused(appview_t* opaque, int focused) {
         }
     }
     wl_display_flush_clients(view->display);
+}
+
+extern "C" int appview_text_input_active(appview_t* opaque) {
+    auto* view = static_cast<appview*>(opaque);
+    if (!view) return 0;
+    for (auto* input : view->textInputs) {
+        if (textInputIsActive(input)) return 1;
+    }
+    return 0;
+}
+
+extern "C" void appview_text_input_preedit(appview_t* opaque, const char* text,
+                                            int cursorBegin, int cursorEnd) {
+    auto* view = static_cast<appview*>(opaque);
+    if (!view) return;
+    for (auto* input : view->textInputs) {
+        if (!textInputIsActive(input) || !input->resource) continue;
+        zwp_text_input_v3_send_preedit_string(
+            input->resource, text ? text : "", cursorBegin, cursorEnd);
+        zwp_text_input_v3_send_done(input->resource, input->commitSerial);
+    }
+    if (view->display) wl_display_flush_clients(view->display);
+}
+
+extern "C" void appview_text_input_commit(appview_t* opaque, const char* text) {
+    auto* view = static_cast<appview*>(opaque);
+    if (!view) return;
+    for (auto* input : view->textInputs) {
+        if (!textInputIsActive(input) || !input->resource) continue;
+        zwp_text_input_v3_send_commit_string(input->resource, text ? text : "");
+        zwp_text_input_v3_send_preedit_string(input->resource, nullptr, 0, 0);
+        zwp_text_input_v3_send_done(input->resource, input->commitSerial);
+    }
+    if (view->display) wl_display_flush_clients(view->display);
+}
+
+extern "C" void appview_text_input_delete_surrounding(appview_t* opaque,
+                                                        unsigned int beforeLength,
+                                                        unsigned int afterLength) {
+    auto* view = static_cast<appview*>(opaque);
+    if (!view) return;
+    for (auto* input : view->textInputs) {
+        if (!textInputIsActive(input) || !input->resource) continue;
+        zwp_text_input_v3_send_delete_surrounding_text(input->resource, beforeLength, afterLength);
+        zwp_text_input_v3_send_done(input->resource, input->commitSerial);
+    }
+    if (view->display) wl_display_flush_clients(view->display);
 }

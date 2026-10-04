@@ -17,7 +17,7 @@ plugins {
 val nativeVersion = "1.13.0-alpha09"
 val libraryVersion =
     providers.gradleProperty("VERSION_NAME")
-        .orElse("0.1.0-SNAPSHOT")
+        .orElse("0.1.1-SNAPSHOT")
         .get()
 
 group = providers.gradleProperty("GROUP").orElse("dev.brahmkshatriya.wayland").get()
@@ -161,6 +161,32 @@ val generateFractionalScaleCode = protocolTask(
     "fractional-scale-v1-protocol.c",
 )
 
+val generateXdgDecorationHeader = protocolTask(
+    "generateXdgDecorationHeader",
+    "server-header",
+    "/usr/share/wayland-protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml",
+    "xdg-decoration-unstable-v1-server-protocol.h",
+)
+val generateXdgDecorationCode = protocolTask(
+    "generateXdgDecorationCode",
+    "private-code",
+    "/usr/share/wayland-protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml",
+    "xdg-decoration-unstable-v1-protocol.c",
+)
+
+val generateTextInputHeader = protocolTask(
+    "generateTextInputHeader",
+    "server-header",
+    "/usr/share/wayland-protocols/unstable/text-input/text-input-unstable-v3.xml",
+    "text-input-unstable-v3-server-protocol.h",
+)
+val generateTextInputCode = protocolTask(
+    "generateTextInputCode",
+    "private-code",
+    "/usr/share/wayland-protocols/unstable/text-input/text-input-unstable-v3.xml",
+    "text-input-unstable-v3-protocol.c",
+)
+
 val nativeHeaders = files(
     nativeSourceDir.file("appview.cpp"),
     nativeIncludeDir.file("appview.h"),
@@ -176,6 +202,8 @@ fun KotlinNativeTarget.configureAppViewInterop() {
     val dmabufObject = targetDir.map { it.file("linux-dmabuf-protocol.o") }
     val viewporterObject = targetDir.map { it.file("viewporter-protocol.o") }
     val fractionalObject = targetDir.map { it.file("fractional-scale-v1-protocol.o") }
+    val decorationObject = targetDir.map { it.file("xdg-decoration-unstable-v1-protocol.o") }
+    val textInputObject = targetDir.map { it.file("text-input-unstable-v3-protocol.o") }
     val archive = targetDir.map { it.file("libwayland-appview.a") }
 
     val configuredCxx = providers.environmentVariable("WAYLAND_APPVIEW_${stem}_CXX")
@@ -210,7 +238,7 @@ fun KotlinNativeTarget.configureAppViewInterop() {
     )
 
     val compileAppView = tasks.register<Exec>("compileAppView$suffix") {
-        dependsOn(generateXdgHeader, generateDmabufHeader, generateViewporterHeader, generateFractionalScaleHeader)
+        dependsOn(generateXdgHeader, generateDmabufHeader, generateViewporterHeader, generateFractionalScaleHeader, generateXdgDecorationHeader, generateTextInputHeader)
         inputs.files(nativeHeaders)
         outputs.file(appViewObject)
         doFirst {
@@ -263,10 +291,22 @@ fun KotlinNativeTarget.configureAppViewInterop() {
         "fractional-scale-v1-protocol.c",
         fractionalObject,
     )
+    val compileDecoration = protocolCompileTask(
+        "compileXdgDecoration$suffix",
+        generateXdgDecorationCode,
+        "xdg-decoration-unstable-v1-protocol.c",
+        decorationObject,
+    )
+    val compileTextInput = protocolCompileTask(
+        "compileTextInput$suffix",
+        generateTextInputCode,
+        "text-input-unstable-v3-protocol.c",
+        textInputObject,
+    )
 
     val archiveBridge = tasks.register<Exec>("archiveAppViewBridge$suffix") {
-        dependsOn(compileAppView, compileXdg, compileDmabuf, compileViewporter, compileFractional)
-        inputs.files(appViewObject, xdgObject, dmabufObject, viewporterObject, fractionalObject)
+        dependsOn(compileAppView, compileXdg, compileDmabuf, compileViewporter, compileFractional, compileDecoration, compileTextInput)
+        inputs.files(appViewObject, xdgObject, dmabufObject, viewporterObject, fractionalObject, decorationObject, textInputObject)
         outputs.file(archive)
         doFirst {
             val toolchain = resolveToolchain()
@@ -280,6 +320,8 @@ fun KotlinNativeTarget.configureAppViewInterop() {
                         dmabufObject.get().asFile.absolutePath,
                         viewporterObject.get().asFile.absolutePath,
                         fractionalObject.get().asFile.absolutePath,
+                        decorationObject.get().asFile.absolutePath,
+                        textInputObject.get().asFile.absolutePath,
                     ),
             )
         }
@@ -302,6 +344,7 @@ fun KotlinNativeTarget.configureAppViewInterop() {
 
     tasks.matching { it.name == "cinteropAppview$suffix" }.configureEach {
         dependsOn(archiveBridge)
+        inputs.file(archive)
     }
 }
 
